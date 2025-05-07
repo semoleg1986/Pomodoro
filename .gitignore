@@ -1,0 +1,6 @@
+/.idea
+/build
+/pomodoro.egg-info
+/pomodoro_log.json
+/setup.py
+/venv
