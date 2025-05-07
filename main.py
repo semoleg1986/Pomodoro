@@ -4,6 +4,30 @@ import datetime
 import time
 import os
 import sys
+import platform
+from typing import Optional
+
+
+def get_notification_command():
+    """Возвращает команду для уведомлений в зависимости от ОС."""
+    system = platform.system()
+    if system == "Darwin":  # macOS
+        return "say"
+    elif system == "Linux":
+        return "notify-send"
+    elif system == "Windows":
+        return "powershell -c (New-Object Media.SoundPlayer 'C:\\Windows\\Media\\notify.wav').PlaySync()"
+    return None
+
+
+def play_notification(message: str):
+    """Воспроизводит уведомление в зависимости от ОС."""
+    command = get_notification_command()
+    if command:
+        if platform.system() == "Windows":
+            os.system(command)
+        else:
+            os.system(f"{command} '{message}'")
 
 
 def pluralize_seconds(n):
@@ -19,39 +43,76 @@ def pluralize_seconds(n):
         return "секунд"
 
 
-def counter(min, notice="Работаем"):
-    today = datetime.datetime.now()
-    # print(f"Старт подомодоро {num}:", today.strftime('%d-%m-%Y %HH-%MM-%SS'))
-    finish_time = today + datetime.timedelta(minutes=min)
-    while datetime.datetime.now() < finish_time:
-        remaining = finish_time - datetime.datetime.now()
-        remaining_str = str(remaining).split(".")[0]
-        # print(f"{notice} {remaining_str}", end="\r", flush=True)
-        click.echo(f"\r{notice}: {click.style(remaining_str, fg='green')}", nl=False)
-
-        time.sleep(1)
-    click.echo("\a")
-    # print(f"\a\nКонец: {datetime.datetime.now().strftime('%d-%m-%Y %HH-%MM-%SS')}")
-    # os.system(f'say Время закончено')
+def format_time(seconds: int) -> str:
+    """Форматирует время в читаемый вид."""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
-def sets_of_pomodoros(pomodoros, size):
-    return [pomodoros[i : i + size] for i in range(0, len(pomodoros), size)]
+def counter(minutes: int, notice: str = "Работаем", pause_event: Optional[click.Context] = None):
+    """Счетчик с возможностью паузы и прогресс-баром."""
+    total_seconds = minutes * 60
+    start_time = datetime.datetime.now()
+    finish_time = start_time + datetime.timedelta(minutes=minutes)
+    
+    with click.progressbar(length=total_seconds, label=notice) as bar:
+        while datetime.datetime.now() < finish_time:
+            if pause_event and pause_event.paused:
+                click.echo("\nПауза. Нажмите Enter для продолжения...")
+                input()
+                pause_event.paused = False
+                start_time = datetime.datetime.now() - datetime.timedelta(seconds=bar.pos)
+                finish_time = start_time + datetime.timedelta(minutes=minutes)
+            
+            remaining = finish_time - datetime.datetime.now()
+            remaining_seconds = int(remaining.total_seconds())
+            
+            if remaining_seconds < 0:
+                break
+                
+            bar.update(1)
+            time.sleep(1)
+    
+    play_notification(f"{notice} завершено")
 
 
-def set_pomodoro(sets, work_min, break_min, relax_min):
+def sets_of_pomodoros(pomodoros: list, size: int) -> list:
+    """Разбивает список помидоров на сеты."""
+    return [pomodoros[i:i + size] for i in range(0, len(pomodoros), size)]
+
+
+def set_pomodoro(sets: list, work_min: int, break_min: int, relax_min: int, pause_event: Optional[click.Context] = None):
+    """Выполняет набор помидоров с перерывами."""
     for index, set in enumerate(sets, 1):
         click.clear()
         for i, j in enumerate(set, 1):
             click.echo(f"Сессия {index}")
-            os.system(f"say Сессия {index}. Помодоро {i}")
+            play_notification(f"Сессия {index}. Помодоро {i}")
             click.echo(f'Помодоро {i}: {"🍅" * j}')
-            counter(work_min)
-            sys.stdout.write("\033[F\033[K")
-            sys.stdout.flush()
-            counter(break_min, notice="Отдыхаем")
+            
+            try:
+                counter(work_min, pause_event=pause_event)
+                sys.stdout.write("\033[F\033[K")
+                sys.stdout.flush()
+                counter(break_min, notice="Отдыхаем", pause_event=pause_event)
+            except KeyboardInterrupt:
+                if click.confirm("Хотите прервать текущий помодоро?"):
+                    return
+                continue
+                
             click.clear()
-        counter(relax_min, notice="Большой отдых")
+        counter(relax_min, notice="Большой отдых", pause_event=pause_event)
+
+
+class PomodoroContext(click.Context):
+    """Контекст для хранения состояния паузы."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.paused = False
 
 
 @click.command()
@@ -80,11 +141,24 @@ def set_pomodoro(sets, work_min, break_min, relax_min):
 @click.confirmation_option(prompt="Запускаем?")
 def cli(work_min, break_min, relax_min, pomodoros, size):
     """Помодоро в терминале. Легкая настройка и адаптация для любых ваших задач"""
-    # click.clear()
-    all_pomodoros = list(range(1, pomodoros + 1))
-    sets = sets_of_pomodoros(all_pomodoros, size)
-    set_pomodoro(sets, work_min, break_min, relax_min)
-    os.system(f"say Конец")
+    try:
+        if not all(x > 0 for x in [work_min, break_min, relax_min, pomodoros, size]):
+            raise click.BadParameter("Все значения должны быть положительными числами")
+            
+        if pomodoros < size:
+            raise click.BadParameter("Количество помидоров должно быть больше или равно размеру сета")
+            
+        ctx = PomodoroContext(cli)
+        all_pomodoros = list(range(1, pomodoros + 1))
+        sets = sets_of_pomodoros(all_pomodoros, size)
+        set_pomodoro(sets, work_min, break_min, relax_min, pause_event=ctx)
+        play_notification("Конец")
+        
+    except KeyboardInterrupt:
+        click.echo("\nПрограмма прервана пользователем")
+    except Exception as e:
+        click.echo(f"Произошла ошибка: {str(e)}", err=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
